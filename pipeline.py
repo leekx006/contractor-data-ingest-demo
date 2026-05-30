@@ -11,6 +11,42 @@ from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 import anthropic
 
+# ── Semantic Matching ─────────────────────────────────────
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+
+class SemanticMatcher:
+    _instance = None
+
+    @classmethod
+    def get(cls):
+        """Singleton — load model once and reuse."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self, threshold=0.72):
+        self.threshold = threshold
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    def best_match(self, text, candidates):
+        """
+        Returns the best matching candidate string if similarity
+        exceeds threshold, otherwise None.
+        """
+        if not text or not candidates:
+            return None
+        text_emb  = self.model.encode([text])
+        cand_embs = self.model.encode(candidates)
+        scores    = cosine_similarity(text_emb, cand_embs)[0]
+        best_idx  = int(np.argmax(scores))
+        if scores[best_idx] >= self.threshold:
+            return candidates[best_idx]
+        return None
+
+
 # ── Color objects (for TableStyle) ───────────────────────
 DARK_BLUE  = colors.HexColor("#1F4E79")
 LIGHT_BLUE = colors.HexColor("#D6E4F0")
@@ -38,32 +74,157 @@ RAG_COLORS = {
     "RED":   (RED_FG,   RED_BG,   RED_HEX),
 }
 
+# ── Company label variations ──────────────────────────────
 COMPANY_LABELS = [
-    "Legal Name", "DBA", "Federal Tax ID", "Year Established",
-    "Headquarters", "Field Employees", "Office Staff",
-    "Union / Non-Union", "Primary Services", "Annual Revenue",
-    "Annual Manhours", "ISNetworld ID", "Avetta ID"
+    "Legal Name", "Legal Entity Name", "Legal Company Name",
+    "Company Name", "Business Name", "Contractor Name",
+    "DBA", "Trade Name", "Also Known As", "Doing Business As",
+    "Federal Tax ID", "Tax ID Number", "IRS EIN", "FEIN",
+    "Federal Employer ID", "EIN",
+    "Year Established", "Established", "In Business Since",
+    "Founded", "Year Founded",
+    "Headquarters", "Company Location", "Main Office",
+    "Where We Operate", "Business Address", "Primary Location",
+    "Office Location", "Corporate Address",
+    "Field Employees", "Number of Employees", "Field Workforce",
+    "How Many Workers", "Total Employees", "Craft Employees",
+    "Field Workers", "Field Personnel",
+    "Office Staff", "Administrative Staff", "Office Personnel",
+    "Admin Staff",
+    "Union / Non-Union", "Labor Relations", "Union Status",
+    "Union or Non-Union",
+    "Primary Services", "Work Performed", "What We Do",
+    "Services Provided", "Scope of Work", "Trade",
+    "Primary Trade", "Services",
+    "Annual Revenue", "Yearly Revenue", "Annual Sales", "Revenue",
+    "Annual Manhours", "Hours Per Year", "Annual Man Hours",
+    "Manhours", "Annual Hours Worked",
+    "ISNetworld ID", "ISNetworld", "ISN ID", "ISN Number",
+    "Avetta ID", "Avetta", "Avetta Number",
 ]
+
+# ── Section header variations ─────────────────────────────
+EMR_HEADERS = [
+    "EMR Documentation", "Experience Modification Rate",
+    "EMR History", "Modification Rate",
+    "Insurance and Safety Rating", "Workers Compensation Rate",
+    "EMR Information", "Experience Mod", "EMR",
+]
+
+OSHA_STAT_HEADERS = [
+    "OSHA Incident Statistics", "Safety Performance Summary",
+    "Safety Incident Summary", "Safety Record",
+    "Our Safety Record", "Incident Statistics",
+    "Safety Statistics", "OSHA Statistics",
+    "Safety Performance", "Injury Statistics",
+    "Incident Rates", "OSHA Recordables",
+]
+
+OSHA_CITATION_HEADERS = [
+    "OSHA Citation History", "Citation History",
+    "OSHA Citations", "Regulatory History",
+    "Citation Summary", "OSHA Violations",
+    "Employee Training", "Training Matrix",
+    "Training Records", "Workforce Training",
+]
+
 
 # ── Extraction ────────────────────────────────────────────
 def extract_table_columns(lines, known_labels):
     result = {}
     label_set = set(known_labels)
+    matcher = SemanticMatcher.get()
     i = 0
     while i < len(lines):
-        if lines[i] in label_set:
-            label_block = []
-            j = i
-            while j < len(lines) and lines[j] in label_set:
-                label_block.append(lines[j])
+        line = lines[i]
+        # Layer 1: exact string match
+        matched_label = line if line in label_set else None
+        # Layer 2: semantic match fallback
+        # Exclude section headers like "2. Primary Contacts"
+        if (matched_label is None and len(line) > 3 and len(line) < 60
+                and not re.match(r"^\d+\.", line)):
+            matched_label = matcher.best_match(line, known_labels)
+        if matched_label is not None:
+            # Collect consecutive matched labels
+            label_block = [matched_label]
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j]
+                # Check next line for label match
+                if next_line in label_set:
+                    next_match = next_line
+                elif (len(next_line) > 3 and len(next_line) < 60
+                        and not re.match(r"^\d+\.", next_line)):
+                    next_match = matcher.best_match(next_line, known_labels)
+                else:
+                    next_match = None
+                if next_match is not None:
+                    label_block.append(next_match)
+                    j += 1
+                else:
+                    break
+            # Skip section headers between labels and values
+            while j < len(lines) and re.match(r"^\d+\.", lines[j]):
                 j += 1
-            value_block = lines[j:j + len(label_block)]
-            for k, label in enumerate(label_block):
-                if k < len(value_block):
-                    result[label] = value_block[k]
+            # Skip section headers between labels and values
+            while j < len(lines) and re.match(r"^\d+\.", lines[j]):
+                j += 1
+            # Collect values, merging lowercase continuation lines
+            value_block = []
+            k = j
+            while k < len(lines) and len(value_block) < len(label_block):
+                line_val = lines[k]
+                if (value_block and line_val
+                        and line_val[0].islower()):
+                    value_block[-1] = value_block[-1] + " " + line_val
+                else:
+                    value_block.append(line_val)
+                k += 1
+            for idx, label in enumerate(label_block):
+                if idx < len(value_block):
+                    result[label] = value_block[idx]
             i = j + len(label_block)
         else:
             i += 1
+    return result
+
+
+def normalize_company_info(raw):
+    """Map alternative label names to standard field names."""
+    mapping = {
+        "company_name": [
+            "Legal Name", "Legal Entity Name", "Legal Company Name",
+            "Company Name", "Business Name", "Contractor Name",
+        ],
+        "dba": [
+            "DBA", "Trade Name", "Also Known As", "Doing Business As",
+        ],
+        "headquarters": [
+            "Headquarters", "Company Location", "Main Office",
+            "Where We Operate", "Business Address", "Primary Location",
+            "Office Location", "Corporate Address",
+        ],
+        "field_employees": [
+            "Field Employees", "Number of Employees", "Field Workforce",
+            "How Many Workers", "Total Employees", "Craft Employees",
+            "Field Workers", "Field Personnel",
+        ],
+        "annual_revenue": [
+            "Annual Revenue", "Yearly Revenue", "Annual Sales", "Revenue",
+        ],
+        "annual_manhours": [
+            "Annual Manhours", "Hours Per Year", "Annual Man Hours",
+            "Manhours", "Annual Hours Worked",
+        ],
+    }
+    result = {}
+    for standard_key, alternatives in mapping.items():
+        for alt in alternatives:
+            if alt in raw:
+                result[standard_key] = raw[alt]
+                break
+        if standard_key not in result:
+            result[standard_key] = None
     return result
 
 
@@ -74,21 +235,21 @@ def extract_contractor_fields(pdf_file):
     """
     try:
         if hasattr(pdf_file, 'read'):
-            import io
             pdf_file = io.BytesIO(pdf_file.read())
         text = extract_text(pdf_file)
     except Exception as e:
         return {"error": str(e)}
 
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    company_info = extract_table_columns(lines, COMPANY_LABELS)
+    raw_company_info = extract_table_columns(lines, COMPANY_LABELS)
+    company_info = normalize_company_info(raw_company_info)
 
     def extract_emr():
         emr_start, emr_end = None, None
         for i, line in enumerate(lines):
-            if "EMR Documentation" in line:
+            if any(x in line for x in EMR_HEADERS):
                 emr_start = i
-            if emr_start and i > emr_start and "OSHA Incident Statistics" in line:
+            if emr_start and i > emr_start and any(x in line for x in OSHA_STAT_HEADERS):
                 emr_end = i
                 break
         if emr_start is None:
@@ -106,15 +267,15 @@ def extract_contractor_fields(pdf_file):
         ]
 
     def extract_osha_stats():
-        OSHA_HEADERS = {
+        OSHA_COL_HEADERS = {
             "Year", "Hours", "Worked", "Recordables",
             "TRIR", "DART", "Lost Time", "Cases", "Fatalities"
         }
         osha_start, osha_end = None, None
         for i, line in enumerate(lines):
-            if "OSHA Incident Statistics" in line:
+            if any(x in line for x in OSHA_STAT_HEADERS):
                 osha_start = i + 1
-            if osha_start and i > osha_start and "OSHA Citation History" in line:
+            if osha_start and i > osha_start and any(x in line for x in OSHA_CITATION_HEADERS):
                 osha_end = i
                 break
         if osha_start is None:
@@ -122,7 +283,7 @@ def extract_contractor_fields(pdf_file):
         section = lines[osha_start: osha_end if osha_end else osha_start + 50]
         data_lines = []
         for line in section:
-            if line in OSHA_HEADERS:
+            if line in OSHA_COL_HEADERS:
                 continue
             if re.match(r"^20\d{2}$", line):
                 data_lines.append(line)
@@ -187,12 +348,12 @@ def extract_contractor_fields(pdf_file):
                       if result_match else "Not found")
 
     return {
-        "company_name":    company_info.get("Legal Name", "Unknown"),
-        "dba":             company_info.get("DBA"),
-        "headquarters":    company_info.get("Headquarters"),
-        "field_employees": company_info.get("Field Employees"),
-        "annual_revenue":  company_info.get("Annual Revenue"),
-        "annual_manhours": company_info.get("Annual Manhours"),
+        "company_name":    company_info.get("company_name") or "Unknown",
+        "dba":             company_info.get("dba"),
+        "headquarters":    company_info.get("headquarters"),
+        "field_employees": company_info.get("field_employees"),
+        "annual_revenue":  company_info.get("annual_revenue"),
+        "annual_manhours": company_info.get("annual_manhours"),
         "emr_history":     emr_history,
         "osha_stats":      osha_stats,
         "overall_result":  overall_result,
@@ -267,7 +428,7 @@ def score_contractor(data):
 def generate_explanation(company_name, scoring, data, api_key):
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        flags  = data["red_flags"]
+        flags    = data["red_flags"]
         emr_val  = data["emr_history"][0]["emr"] if data["emr_history"] else "N/A"
         trir_val = data["osha_stats"][0]["trir"]  if data["osha_stats"]  else "N/A"
         fat_val  = data["osha_stats"][0]["fatalities"] if data["osha_stats"] else "N/A"
@@ -329,17 +490,21 @@ def make_styles():
         textColor=colors.gray, alignment=TA_CENTER))
     return s
 
+
 def sp(h=6):
     return Spacer(1, h)
+
 
 def hr():
     return HRFlowable(width="100%", thickness=0.5,
                       color=LIGHT_BLUE, spaceAfter=4)
 
+
 def th_para(text):
     return Paragraph(text, ParagraphStyle(
         "TH", fontName="Helvetica-Bold", fontSize=9,
         textColor=colors.white, alignment=TA_CENTER))
+
 
 def rag_label(rag):
     _, bg, fg_hex = RAG_COLORS[rag]
@@ -349,12 +514,14 @@ def rag_label(rag):
         ParagraphStyle("rl", fontName="Helvetica-Bold",
                        fontSize=9, backColor=bg))
 
+
 def score_bar(score, max_pts, rag):
     _, _, fg_hex = RAG_COLORS[rag]
     pct = int((score / max_pts) * 100) if max_pts else 0
     return Paragraph(
         f'<font color="{fg_hex}"><b>{score}/{max_pts} ({pct}%)</b></font>',
         ParagraphStyle("sb", fontName="Helvetica-Bold", fontSize=9))
+
 
 def base_table_style():
     return TableStyle([
@@ -367,6 +534,7 @@ def base_table_style():
         ("LEFTPADDING",   (0,0), (-1,-1), 6),
         ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
     ])
+
 
 def generate_scorecard_pdf(company_name, data, scoring, explanation=None):
     """
@@ -404,11 +572,11 @@ def generate_scorecard_pdf(company_name, data, scoring, explanation=None):
     # Company info
     story.append(Paragraph(company_name, s["CoName"]))
     info_parts = [
-        f"<b>DBA:</b> {data.get('dba', 'N/A')}",
-        f"<b>HQ:</b> {data.get('headquarters', 'N/A')}",
-        f"<b>Employees:</b> {data.get('field_employees', 'N/A')}",
-        f"<b>Revenue:</b> {data.get('annual_revenue', 'N/A')}",
-        f"<b>Manhours:</b> {data.get('annual_manhours', 'N/A')}",
+        f"<b>DBA:</b> {data.get('dba') or 'N/A'}",
+        f"<b>HQ:</b> {data.get('headquarters') or 'N/A'}",
+        f"<b>Employees:</b> {data.get('field_employees') or 'N/A'}",
+        f"<b>Revenue:</b> {data.get('annual_revenue') or 'N/A'}",
+        f"<b>Manhours:</b> {data.get('annual_manhours') or 'N/A'}",
     ]
     story.append(Paragraph("   |   ".join(info_parts), s["CoInfo"]))
     story += [sp(6), hr()]
@@ -483,6 +651,12 @@ def generate_scorecard_pdf(company_name, data, scoring, explanation=None):
                           colWidths=[1.6*inch, 1.6*inch, 4.0*inch])
         emr_table.setStyle(base_table_style())
         story += [emr_table, sp(10)]
+    else:
+        story.append(Paragraph(
+            "EMR data could not be extracted from this document.",
+            ParagraphStyle("warn", fontName="Helvetica",
+                           fontSize=9, textColor=AMBER_FG)))
+        story.append(sp(10))
 
     # OSHA Statistics
     story.append(Paragraph("OSHA Incident Statistics", s["SecHdr"]))
@@ -516,6 +690,12 @@ def generate_scorecard_pdf(company_name, data, scoring, explanation=None):
         osha_ts.add("ALIGN", (1,1), (-1,-1), "CENTER")
         osha_table.setStyle(osha_ts)
         story += [osha_table, sp(10)]
+    else:
+        story.append(Paragraph(
+            "OSHA statistics could not be extracted from this document.",
+            ParagraphStyle("warn", fontName="Helvetica",
+                           fontSize=9, textColor=AMBER_FG)))
+        story.append(sp(10))
 
     # Risk Flags
     story.append(Paragraph("Risk Flags", s["SecHdr"]))
